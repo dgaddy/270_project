@@ -20,9 +20,9 @@ while((my $f0 = <FILE0>) and (my $f1 = <FILE1>)) {
     chomp $f0; chomp $f1;
     my (%ref_sure, %ref_prob);
     for(split(/ /, $f0)) {
-        /(P-|S-|)(\d+-\d+)/ or die "badly formatted alignment\n";
-        $ref_prob{$2}++;
-        $ref_sure{$2}++ if $1 ne "P-";
+        /(\d+-\d+)(-P|)/ or die "badly formatted alignment\n";
+        $ref_prob{$1}++;
+        $ref_sure{$1}++ if $2 ne "-P";
     }
     my %test = map { $_ => 1 } split(/ /,$f1);
     $ref += keys %ref_sure;
