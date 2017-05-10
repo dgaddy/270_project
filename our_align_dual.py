@@ -304,6 +304,12 @@ def main(language = 'french'):
         gold_file = 'data/align-dev.txt'
         reverse_output = True
         model_folder = 'models_jap'
+    elif language == 'chinese':
+        train_files = {'en':'data/fbis/unsupervised_train/unsup_train.en', 'f':'data/fbis/unsupervised_train/unsup_train.zh'}
+        dev_files = {'en':'data/fbis/gold/supervised-train-fixed/supervised.en', 'f':'data/fbis/gold/supervised-train-fixed/supervised.ch'}
+        gold_file = 'data/fbis/gold/supervised-train-fixed/supervised.align'
+        reverse_output = True
+        model_folder = 'models_ch'
     elif language == 'french':
         train_files = {'en':'fr_data/europarl-v6.fr-en.en', 'f':'fr_data/europarl-v6.fr-en.fr'}
         dev_files = {'en':'fr_data/en-fr.en', 'f':'fr_data/en-fr.fr'}
