@@ -179,7 +179,7 @@ def update_us(us, alignments_ef, alignments_fe, learning_rate):
 
     return us + learning_rate * diff_cs, (diff_cs == 0).all() # the second return value indicates convergence
 
-def align_dual(es, fs, t_ef, t_fe, q_ef, q_fe, alpha=1):
+def align_dual(es, fs, t_ef, t_fe, q_ef, q_fe, alpha=1, iterations=250):
     # for the two languages e and f, es and fs and the sentences, t is the word translations, and
     # q is the position translation probabilities
 
@@ -200,7 +200,7 @@ def align_dual(es, fs, t_ef, t_fe, q_ef, q_fe, alpha=1):
             real_probs_ef[ei, fi] = t_ef[(ew, fw)]
             real_probs_fe[fi, ei] = t_fe[(fw, ew)]
 
-    for i in range(250):
+    for i in range(iterations):
         learning_rate = 1 / (i + 1)
 
         translation_probs_ef = update_probs(real_probs_ef, us, True, alpha=alpha)
