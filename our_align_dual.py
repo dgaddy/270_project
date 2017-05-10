@@ -7,48 +7,8 @@ from math import exp
 import numpy as np
 import pickle
 from numba import jit
-
-def forward(e, f, I, J, t, q):
-    a = [[0] * J for _ in range(I)]
-    for i in range(I):
-        a[i][0] = q[(i, -1, I)] * t[(e[i], f[0])]
-    s = sum([a[i][0] for i in range(I)])
-    for i in range(I):
-        a[i][0] /= s
-    qh = [[0] * I for _ in range(I)]
-    for i in range(I):
-        for ip in range(I):
-            qh[i][ip] = q[(i, ip, I)]
-    for j in range(1, J):
-        for i in range(I):
-            th = t[(e[i], f[j])]
-            for ip in range(I):
-                a[i][j] += a[ip][j - 1] * qh[i][ip] * th
-        s = sum([a[i][j] for i in range(I)])
-        for i in range(I):
-            a[i][j] /= s
-    return a
-
-def backward(e, f, I, J, t, q):
-    b = [[0] * J for _ in range(I)]
-    for ip in range(I):
-        b[ip][J - 1] = 1.
-    s = sum([b[ip][J - 1] for ip in range(I)])
-    for ip in range(I):
-        b[ip][J - 1] /= s
-    qh = [[0] * I for _ in range(I)]
-    for i in range(I):
-        for ip in range(I):
-            qh[i][ip] = q[(i, ip, I)]
-    for j in range(J - 2, -1, -1):
-        for i in range(I):
-            th = t[(e[i], f[j + 1])]
-            for ip in range(I):
-                b[ip][j] += b[i][j + 1] * qh[i][ip] * th
-        s = sum([b[ip][j] for ip in range(I)])
-        for ip in range(I):
-            b[ip][j] /= s
-    return b
+import os
+import os.path as path
 
 '''
 Count number of translation probabilities that changed by more than p between
@@ -56,7 +16,7 @@ iterations
 '''
 def dictdiff(x, y, p):
     c = 0
-    for k in x.keys():
+    for k in x.keys(): # assumes x and y share same keys
         if abs(x[k] - y[k]) > p:
             c += 1
     return c
@@ -64,588 +24,371 @@ def dictdiff(x, y, p):
 '''
 Calculate translation probabilities
 '''
-def train_ibm1(ej, t, m, p):
-    c = 0
-    while True:
+def train_ibm(sentences_zipped, initial_translation_probs, max_iters, precision, ibm2=False):
+    # sentences_zipped is a list of tuples of two aligned sentences
+    # we call these e and f locally for english and foreign, but this will actually be run in both directions
+    # both sentences should start with a null word
+
+    # we are modeling generating foreign words from english here
+
+    # translation probs t[(e,f)] is p(f|e)
+    # if doing ibm model 2, we also have q[(e_idx,f_idx,e_len,f_len)] is p(e_idx|f_idx,e_len,f_len)
+    # the idea is that the probability of a foreign word f is the probability of being aligned to
+    # the word at e_idx (from q) times the probability of the english word generating f (from t)
+
+    t = initial_translation_probs
+    if ibm2:
+        q = defaultdict(random)
+
+    for itr in range(max_iters):
+        # count dictionaries
         cef = defaultdict(float)
         ce = defaultdict(float)
         cjilm = defaultdict(float)
         cilm = defaultdict(float)
-        dd = defaultdict(float)
 
         #calculate counts
-        for (es, js) in ej:
-            le = len(es)
-            lj = len(js)
-            for (i, f) in enumerate(js):
-                dd[i] = 0
-                for (j, e) in enumerate(es):
-                    dd[i] += t[(e, f)]
-            for (i, f) in enumerate(js):
-                ddt = dd[i]
-                for (j, e) in enumerate(es):
-                    if t[(e, f)] != 0:
-                        d = t[(e, f)] / ddt
-                        cef[(e, f)] += d
-                        ce[e] += d
-                        cjilm[(i, j, le, lj)] += d
-                        cilm[(i, le, lj)] += d
+        for (es, fs) in sentences_zipped:
+            le, lf = len(es), len(fs)
+            for (f_idx, f_word) in enumerate(fs):
+                if f_idx == 0:
+                    continue # skip null word
+
+                # calculate probabilities of f_word coming from each e_word
+                if ibm2:
+                    probs = [t[(e_word, f_word)] * q[(e_idx, f_idx, le, lf)] for e_idx,e_word in enumerate(es)]
+                else:
+                    probs = [t[(e_word, f_word)] for e_idx,e_word in enumerate(es)]
+                                
+                sum_p = sum(probs)
+                probs = [p/sum_p for p in probs] # normalize probabilites
+
+                # update counts
+                for e_idx, (e_word, p) in enumerate(zip(es, probs)):
+                    if p != 0:
+                        cef[(e_word, f_word)] += p
+                        ce[e_word] += p
+                        cjilm[(e_idx, f_idx, le, lf)] += p
+                        cilm[(f_idx, le, lf)] += p
 
         #save translation probabilities of previous iteration
-        tprev = copy(t)
+        tprev = t
+        t = copy(t)
 
         #calculate translation probabilities
-        for (e, j) in cef.keys():
-            t[(e, j)] = cef[(e, j)] / ce[e]
-        c += 1
+        for (e, f) in cef.keys():
+            t[(e, f)] = cef[(e, f)] / ce[e]
+        if ibm2:
+            q = copy(q)
 
-        #check if no change between iterations or m iterations reached
-        if dictdiff(tprev, t, p) == 0 or c == m:
-            break
+            for (e_idx, f_idx, le, lf) in cjilm.keys():
+                q[(e_idx, f_idx, le, lf)] = cjilm[(e_idx, f_idx, le, lf)] / cilm[(f_idx, le, lf)]
 
-    #print number of iterations run
-    print(c)
-
-    #return translation probabilities
-    return t
-
-def train_ibm2(ej, t, q, m, p):
-    c = 0
-    while True:
-        cef = defaultdict(float)
-        ce = defaultdict(float)
-        cjilm = defaultdict(float)
-        cilm = defaultdict(float)
-        dd = defaultdict(float)
-
-        #calculate counts
-        for (es, js) in ej:
-            le = len(es)
-            lj = len(js)
-            for (i, f) in enumerate(js):
-                dd[i] = 0
-                for (j, e) in enumerate(es):
-                    dd[i] += t[(e, f)] * q[(i, j, le, lj)]
-            for (i, f) in enumerate(js):
-                ddt = dd[i]
-                for (j, e) in enumerate(es):
-                    if t[(e, f)] * q[(i, j, le, lj)] != 0:
-                        d = t[(e, f)] * q[(i, j, le, lj)] / ddt
-                        cef[(e, f)] += d
-                        ce[e] += d
-                        cjilm[(i, j, le, lj)] += d
-                        cilm[(i, le, lj)] += d
-
-        #save translation and transition probabilities of previous iteration
-        tprev = copy(t)
-        qprev = copy(q)
-
-        #calculate translation and transition probabilities
-        for (e, j) in cef.keys():
-            t[(e, j)] = cef[(e, j)] / ce[e]
-        for (i, j, le, lj) in cjilm.keys():
-            q[(i, j, le, lj)] = cjilm[(i, j, le, lj)] / cilm[(i, le, lj)]
-        c += 1
-
-        #check if no change between iterations or m iterations reached
-        if dictdiff(tprev, t, p) == 0 and dictdiff(qprev, q, p) == 0 or c == m:
-            break
-
-    #print number of iterations run
-    print(c)
+        #check change between iterations
+        print(itr,'number of changed probabilites:',dictdiff(tprev, t, precision))
 
     #return translation probabilities
-    return t, q
+    if ibm2:
+        return t,q
+    else:
+        return t
 
-def train_hmm(ej, t, q, m, p):
-    c = 0
-    while True:
-        cef = defaultdict(float)
-        ce = defaultdict(float)
-        ci_1 = defaultdict(float)
-        cii_l = defaultdict(float)
-        for (es, js) in ej:
-            le = len(es)
-            lj = len(js)
-            a = forward(es, js, le, lj, t, q)
-            b = backward(es, js, le, lj, t, q)
-            for (j, e) in enumerate(es):
-                for (i, f) in enumerate(js):
-                    if a[j][i] * b[j][i] != 0:
-                        d = a[j][i] * b[j][i] / sum([a[k][lj - 1] for k in range(le)])
-                        cef[(e, f)] += d
-                        ce[e] += d
-                        if i == 0:
-                            ci_1[(j + 1, le)] += d
-            for j in range(le):
-                for i in range(1, lj):
-                    for jp in range(le):
-                        if a[jp][i - 1] * q[(j, jp, le)] * t[(es[j], js[i])] * b[j][i] != 0:
-                            d = a[jp][i - 1] * q[(j, jp, le)] * t[(es[j], js[i])] * b[j][i] / sum([a[k][lj - 1] for k in range(le)])
-                            cii_l[(j - jp, le)] += d
-        tprev = copy(t)
-        qprev = copy(q)
-        for (e, j) in cef.keys():
-            t[(e, j)] = cef[(e, j)] / ce[e]
-        for (d, le) in ci_1.keys():
-            for j in range(le):
-                if j + 1 == d:
-                    q[(j, -1, le)] = ci_1[(d, le)] / sum([ci_1[(k + 1, le)] for k in range(le)])
-        for (d, le) in cii_l.keys():
-            for j in range(le):
-                for jp in range(le):
-                    if j - jp == d:
-                        q[(j, jp, le)] = cii_l[(d, le)] / sum([cii_l[(k - jp, le)] for k in range(le)])
-        c += 1
-        if dictdiff(tprev, t, p) == 0 and dictdiff(qprev, q, p) == 0 or c == m:
-            break
-    print(c)
-    return (t, q)
+def align_ibm(e_sent, f_sent, t, q=None):
+    # creates alignment variables for each word in f_sent
+    # the values point to a location in e_sent
+    # if q is None, we will use ibm1, otherwise ibm2
+    alignments = []
+    le, lf = len(e_sent), len(f_sent)
+    for f_idx, f_word in enumerate(f_sent):
+        if f_idx == 0:
+            alignments.append(0) # for null word
+            continue
 
-def train_hmm_joint(ej, t, q, t2, q2, m, p, pd):
-    c = 0
-    while True:
-        cef = defaultdict(float)
-        ce = defaultdict(float)
-        cef2 = defaultdict(float)
-        ce2 = defaultdict(float)
-        cii_l = defaultdict(float)
-        cii_l2 = defaultdict(float)
-        for (es, js) in ej:
-            le = len(es)
-            lj = len(js)
-            a = forward(es, js, le, lj, t, q)
-            b = backward(es, js, le, lj, t, q)
-            a2 = forward(js, es, lj, le, t2, q2)
-            b2 = backward(js, es, lj, le, t2, q2)
-            for (j, e) in enumerate(es):
-                for (i, f) in enumerate(js):
-                    if a[j][i] * b[j][i] != 0:
-                        d = a[j][i] * b[j][i] / sum([a[k][lj - 1] for k in range(le)])
-                        cef[(e, f)] += d
-                        ce[e] += d
-                    if a2[i][j] * b2[i][j] != 0:
-                        d = a2[i][j] * b2[i][j] / sum([a2[k][le - 1] for k in range(lj)])
-                        cef2[(f, e)] += d
-                        ce2[f] += d
-            for j in range(le):
-                if pd == 'p':
-                    if a[j][0] * b[j][0] * a2[0][j] * b2[0][j] != 0:
-                        if j == 0:
-                            d = a[j][0] * b[j][0] / sum([a[k][lj - 1] for k in range(le)]) * a2[0][j] * b2[0][j] / sum([a2[k][le - 1] for k in range(lj)])
-                else:
-                    if a[j][0] * b[j][0] + a2[0][j] * b2[0][j] != 0:
-                        if j == 0:
-                            d = (a[j][0] * b[j][0] / sum([a[k][lj - 1] for k in range(le)]) + a2[0][j] * b2[0][j] / sum([a2[k][le - 1] for k in range(lj)])) / 2
-                cii_l[(le, le)] += d
-                for i in range(1, lj):
-                    for jp in range(le):
-                        if pd == 'p':
-                            if a[jp][i - 1] * q[(j, jp, le)] * t[(es[j], js[i])] * b[j][i] * a2[i][j] * b2[i][j] != 0:
-                                d = a[jp][i - 1] * q[(j, jp, le)] * t[(es[j], js[i])] * b[j][i] / sum([a[k][lj - 1] for k in range(le)]) + a2[i][j] * b2[i][j] / sum([a2[k][le - 1] for k in range(lj)])
-                        else:
-                            if a[jp][i - 1] * q[(j, jp, le)] * t[(es[j], js[i])] * b[j][i] + a2[i][j] * b2[i][j] != 0:
-                                d = (a[jp][i - 1] * q[(j, jp, le)] * t[(es[j], js[i])] * b[j][i] / sum([a[k][lj - 1] for k in range(le)]) + a2[i][j] * b2[i][j] / sum([a2[k][le - 1] for k in range(lj)])) / 2
-                        cii_l[(j - jp, le)] += d
-            for j in range(lj):
-                if pd == 'p':
-                    if a2[j][0] * b2[j][0] * a[0][j] * b[0][j] != 0:
-                        if j == 0:
-                            d = a2[j][0] * b2[j][0] / sum([a2[k][le - 1] for k in range(lj)]) * a[0][j] * b[0][j] / sum([a[k][lj - 1] for k in range(le)])
-                else:
-                    if a2[j][0] * b2[j][0] + a[0][j] * b[0][j] != 0:
-                        if j == 0:
-                            d = (a2[j][0] * b2[j][0] / sum([a2[k][le - 1] for k in range(lj)]) + a[0][j] * b[0][j] / sum([a[k][lj - 1] for k in range(le)])) / 2
-                cii_l2[(lj, lj)] += d
-                for i in range(1, le):
-                    for jp in range(lj):
-                        if pd == 'p':
-                            if a2[jp][i - 1] * q2[(j, jp, lj)] * t2[(js[j], es[i])] * b2[j][i] * a[i][j] * b[i][j] != 0:
-                                d = a2[jp][i - 1] * q2[(j, jp, lj)] * t2[(js[j], es[i])] * b2[j][i] / sum([a2[k][le - 1] for k in range(lj)]) * a[i][j] * b[i][j] / sum([a[k][lj - 1] for k in range(le)])
-                        else:
-                            if a2[jp][i - 1] * q2[(j, jp, lj)] * t2[(js[j], es[i])] * b2[j][i] + a[i][j] * b[i][j] != 0:
-                                d = (a2[jp][i - 1] * q2[(j, jp, lj)] * t2[(js[j], es[i])] * b2[j][i] / sum([a2[k][le - 1] for k in range(lj)]) + a[i][j] * b[i][j] / sum([a[k][lj - 1] for k in range(le)])) / 2
-                        cii_l2[(j - jp, lj)] += d
-        tprev = copy(t)
-        qprev = copy(q)
-        t2prev = copy(t2)
-        q2prev = copy(q2)
-        for (e, j) in cef.keys():
-            t[(e, j)] = cef[(e, j)] / ce[e]
-            t2[(j, e)] = cef2[(j, e)] / ce2[j]
-        for (d, le) in cii_l.keys():
-            for j in range(le):
-                if d == le:
-                    q[(j, -1, le)] = cii_l[(d, le)]
-                else:
-                    for jp in range(le):
-                        if j - jp == d:
-                            q[(j, jp, le)] = cii_l[(d, le)] / sum([cii_l[(k - jp, le)] for k in range(le)])
-        for (d, lj) in cii_l2.keys():
-            for j in range(lj):
-                if d == lj:
-                    q2[(j, -1, lj)] = cii_l2[(d, lj)]
-                else:
-                    for jp in range(lj):
-                        if j - jp == d:
-                            q2[(j, jp, lj)] = cii_l2[(d, lj)] / sum([cii_l2[(k - jp, lj)] for k in range(lj)])
-        c += 1
-        if dictdiff(tprev, t, p) == 0 and dictdiff(qprev, q, p) == 0 and dictdiff(t2prev, t2, p) == 0 and dictdiff(q2prev, q2, p) == 0 or c == m:
-            break
-    print(c)
-    return (t, q, t2, q2)
+        if q is not None:
+            probs = [t[(e_word, f_word)] * q[(e_idx, f_idx, le, lf)] for e_idx,e_word in enumerate(e_sent)]
+        else:
+            probs = [t[(e_word, f_word)] for e_idx,e_word in enumerate(e_sent)]
 
-'''
-Align sentence using translation probabilities t
-'''
-def align(es, js, t, q):
-    #ma = defaultdict(int)
-    le = len(es)
-    lj = len(js)
-    ma = [0] * le
-    for (j, e) in enumerate(es):
-        cma = (0, -1)
-        for (i, f) in enumerate(js):
-            va = t[(e, f)] * q[(i, j, le, lj)]
-            if cma[1] < va:
-                cma = (i, va)
-        ma[j] = int(cma[0])
-    return ma
+        a = max(range(len(probs)), key=lambda x: probs[x]) # argmax probability
+        alignments.append(a)
+    return alignments
 
-'''
-Align sentence using translation probabilities t
-'''
-def align2(es, js, m, q):
-    # ma = defaultdict(int)
-    le = len(es)
-    lj = len(js)
-    ma = [0] * le
-    for j in range(len(es)):
-        cma = (0, -1)
-        for i in range(len(js)):
-            va = m[j, i] * q[(i, j, le, lj)]
-            if cma[1] < va:
-                cma = (i, va)
-        ma[j] = cma[0]
-    return ma
+def align2_ibm(e_sent, f_sent, m, q):
+    # like align_ibm, but translation probabilities t have been moved to a matrix m indexed by position
+    # creates alignment variables for each position in f_sent
+    alignments = []
+    le, lf = len(e_sent), len(f_sent)
+    for f_idx in range(len(f_sent)):
+        if f_idx == 0:
+            alignments.append(0) # for null word
+            continue
+
+        if q is not None:
+            probs = [m[e_idx, f_idx] * q[(e_idx, f_idx, le, lf)] for e_idx,e_word in enumerate(e_sent)]
+        else:
+            probs = [m[e_idx, f_idx] for e_idx,e_word in enumerate(e_sent)]
+
+        a = max(range(len(probs)), key=lambda x: probs[x]) # argmax probability
+        alignments.append(a)
+    return alignments
+
+def combine_union(alignments1, alignments2):
+    return list(set(alignments1).union(set(alignments2)))
+
+def combine_intersect(alignments1, alignments2):
+    return [(a,b) for a,b in alignments1 if (a,b) in alignments2]
 
 @jit
-def update_probs(real_probs, us, ej, alpha=1):
+def update_probs(real_probs, us, forward_direction, alpha=1):
+    # takes transition probabilities real_probs and adjusts them based on the dual variables (us)
+    # forward_direction is a boolean used to indicate which of the two directions we are updating
+    # the update is slightly different for each direction
+    # alpha is a parameter that adjusts how much we like alignments that are close but not exact
+
     result = np.zeros_like(real_probs)
     for i in range(1,real_probs.shape[0]):
         for j in range(1,real_probs.shape[1]):
             tmp = 0
             for offset in [-1,1]:
                 if j + offset >= 1 and j + offset < real_probs.shape[1]:
-                    if ej:
+                    if forward_direction:
                         tmp += max(us[i, j + offset] - alpha, 0)
                     else:
                         tmp += max(-us[i, j + offset] - alpha, 0)
-            if ej:
+            if forward_direction:
                 result[i, j] = real_probs[i, j] * exp(us[i, j] + tmp)
             else:
                 result[i, j] = real_probs[i, j] * exp(-us[i, j] + tmp)
     return result
 
-def update_us(us, alignments_ej, alignments_je, learning_rate):
+def update_us(us, alignments_ef, alignments_fe, learning_rate):
+    # us are updated by adding learning_rate*(difference in alignments)
+    # a positive u indicates alignments_fe has an alignment that alignments_ef does not
+    # and positive u means the opposite
+
+    # alignments_ef has an alignment for each foreign word to an english one
+    # alignments_fi has an alignment for each enlgish word to a foreign one
+    # they have both been converted into the format (e_idx, f_idx)
+
     # calculate (c^b-c^a)
-    diff_cs = np.zeros((len(alignments_ej), len(alignments_je)))
-    for i, a in enumerate(alignments_ej):
-        diff_cs[i, a] -= 1
-    for i, a in enumerate(alignments_je):
-        diff_cs[a, i] += 1
+    diff_cs = np.zeros((len(alignments_fe), len(alignments_ef)))
+    for a,b in alignments_ef:
+        diff_cs[a,b] -= 1
+    for a,b in alignments_fe:
+        diff_cs[a,b] += 1
 
-    return us + learning_rate * diff_cs, (diff_cs == 0).all()
+    return us + learning_rate * diff_cs, (diff_cs == 0).all() # the second return value indicates convergence
 
-def combine(alignments_ej, alignments_je):
-    # alignments = []
-    # for i, v in enumerate(alignments_ej):
-    #     alignments.append((i, v))
-    # for i, v in enumerate(alignments_je):
-    #     alignments.append((v, i))
-    # return list(set(alignments))
-    return list(set(list(enumerate(alignments_ej))
-            + [(v, i) for i, v in list(enumerate(alignments_je))]))
+def align_dual(es, fs, t_ef, t_fe, q_ef, q_fe, alpha=1):
+    # for the two languages e and f, es and fs and the sentences, t is the word translations, and
+    # q is the position translation probabilities
 
-def combine_intersect(alignments_ej, alignments_je):
-    # tmp = list(enumerate(alignments_ej))
-    # alignments = []
-    # for i, v in enumerate(alignments_je):
-    #     if (v, i) in tmp:
-    #         alignments.append((v, i))
-    # return alignments
-    return [(v, i) for i, v in list(enumerate(alignments_je))
-            if (v, i) in list(enumerate(alignments_ej))]
-
-def align_dual(es, js, t_ej, t_je, q_ej, q_je, alpha=1):
-    '''
-    returns list of tuples (i,j) for aligning english index i to japanese index
-    j
-    '''
+    # align using dual decomposition to encourage agreement
 
     converged = False
 
-    #a = ej, b = je
-    #initilaize us
-    us = np.zeros((len(es), len(js)))
+    #initilaize the lagrange multipliers u[e_idx,j_idx]
+    us = np.zeros((len(es), len(fs)))
 
-    real_probs_ej = np.zeros((len(es), len(js)))
-    real_probs_je = np.zeros((len(js), len(es)))
-    for m, ew in enumerate(es):
-        for n, jw in enumerate(js):
-            if m == 0 and n == 0:
+    # real_probs is a matrix that holds the transition probabilities t by word index
+    real_probs_ef = np.zeros((len(es), len(fs)))
+    real_probs_fe = np.zeros((len(fs), len(es)))
+    for ei, ew in enumerate(es):
+        for fi, fw in enumerate(fs):
+            if ei == 0 and fi == 0:
                 continue
-            real_probs_ej[m, n] = t_ej[(ew, jw)]
-            real_probs_je[n, m] = t_je[(jw, ew)]
+            real_probs_ef[ei, fi] = t_ef[(ew, fw)]
+            real_probs_fe[fi, ei] = t_fe[(fw, ew)]
 
     for i in range(250):
         learning_rate = 1 / (i + 1)
 
-        translation_probs_ej = update_probs(real_probs_ej, us, True, alpha=alpha)
-        translation_probs_je = update_probs(real_probs_je, np.transpose(us),
+        translation_probs_ef = update_probs(real_probs_ef, us, True, alpha=alpha)
+        translation_probs_fe = update_probs(real_probs_fe, np.transpose(us),
                                     False, alpha=alpha)
 
-        alignments_ej = align2(es, js, translation_probs_ej, q_ej)
-        alignments_je = align2(js, es, translation_probs_je, q_je)
+        # alignments will be ordered (e_idx, f_idx)
+        # alignments_ef has an alignment for each foreign word to a english one
+        alignments_ef = [(b,a) for a,b in enumerate(align2_ibm(es, fs, translation_probs_ef, q_ef))]
+        # alignments_fe has an alignment for each enlgish word to a foreign one
+        alignments_fe = [(a,b) for a,b in enumerate(align2_ibm(fs, es, translation_probs_fe, q_fe))]
 
         # adjust us
-
-        us, done = update_us(us, alignments_ej, alignments_je, learning_rate)
+        us, done = update_us(us, alignments_ef, alignments_fe, learning_rate)
 
         if done:
             converged = True
             break
-    intersection = combine_intersect(alignments_ej, alignments_je)
-    union = combine(alignments_ej, alignments_je)
+    intersection = combine_intersect(alignments_ef, alignments_fe)
+    union = combine_union(alignments_ef, alignments_fe)
     return intersection, union, converged
-    # return combine(alignments_ej, alignments_je), converged
-    # return combine_intersect(alignments_ej, alignments_je), converged
+
+def load_sentences(filename, max_n=None):
+    sents_with_null = []
+    with codecs.open(filename, encoding='utf-8') as f:
+        for line in f:
+            sent = line.lower().replace('\n', '').split(' ')
+            sents_with_null.append(["null_align"] + sent)
+            if max_n is not None and len(sents_with_null) >= max_n:
+                break
+
+    return sents_with_null
+
+def count_words(sentences):
+    return len(set(word for sent in sentences for word in sent))
+
+def train_complete(e_sentences, f_sentences, save_file=None, ibm2=True):
+    # models generation of f_sentences from e_sentences
+    # expects a null word at beginning of all sentences
+
+    n_f = count_words(f_sentences)
+    initial_probs = defaultdict(lambda: 1./n_f)
+
+    sentences = list(zip(f_sentences, f_sentences))
+
+    # t_ef[(e,f)] is p(f|e) for foreign word f and english word e
+    t_ef = train_ibm(sentences, initial_probs, max_iters=10, precision=1e-3, ibm2=False)
+
+    if ibm2:
+        if save_file is not None: # save the ibm1 model first
+            with open(save_file+'.ibm1', 'wb') as fp:
+                pickle.dump((dict(t_ef),None,n_f), fp)
+
+        t_ef, q_ef =  train_ibm(sentences, t_ef, max_iters=5, precision=1e-3, ibm2=True)
+    else:
+        q_ef = None # so we have something to return
+
+    if save_file is not None:
+        with open(save_file, 'wb') as fp:
+            pickle.dump((dict(t_ef),dict(q_ef) if q_ef is not None else None,n_f), fp)
+    
+    return t_ef, q_ef
+
+def load_model(filename):
+    with open(filename, 'rb') as fp:
+        (t, q, n) = pickle.load(fp)
+    #return defaultdict(lambda: 1e-5,t), defaultdict(lambda: 1e-5,q if q is not None else [])
+    return defaultdict(lambda: 1./n,t), defaultdict(random, q) if q is not None else None
+
+def filter_null_alignments(alignments):
+    return [(a,b) for a,b in alignments if a != 0 and b != 0]
+
+def save_alignments(alignments, filename, reverse_direction=False):
+    with open(filename, 'w') as output:
+        for alignment in alignments:
+            for ew, fw in alignment:
+                if ew != 0 and fw != 0:
+                    if reverse_direction:
+                        output.write(str(fw - 1) + '-' + str(ew - 1) + ' ')
+                    else:
+                        output.write(str(ew - 1) + '-' + str(fw - 1) + ' ')
+            output.write('\n')
+
+def eval_alignments(filename, gold_filename):
+    os.system('perl measure-alignment-error.pl %s %s'%(gold_filename,filename))
+
 
 '''
 Train aligner on train and dev sets and align on test set
 '''
-if __name__ == "__main__":
-    #print time at start
-    print(datetime.datetime.now())
+def main(language = 'french'):
+    load_model_from_file = True
+    max_train = 10000 # for quicker debugging
+    ibm2 = True
 
-    #prepare train sentences
-    e = []
-    en = []
-    j = []
-    jn = []
-    # ews = []
-    # jws = []
-    for line in codecs.open('data/english-dev.txt', encoding='utf-8'):
-        # e.append(["null_align"] + line.lower().replace('\n', '').split(' '))
-        # ews += line.lower().replace('\n', '').split(' ')
-        e.append(line.lower().replace('\n', '').split(' '))
-        en.append(["null_align"] + line.lower().replace('\n', '').split(' '))
-    # for line in codecs.open('data/kyoto-train.cln.en', encoding='utf-8'):
-    # #    e.append(["null_align"] + line.lower().replace('\n', ' ').split(' '))
-    #     # ews += line.lower().replace('\n', '').split(' ')
-    #     e.append(line.lower().replace('\n', '').split(' '))
-    #     en.append(["null_align"] + line.lower().replace('\n', '').split(' '))
-    for line in codecs.open('data/japanese-dev.txt', encoding='utf-8'):
-        # j.append(["null_align"] + line.replace('\n', '').split(' '))
-        # jws += line.replace('\n', '').split(' ')
-        j.append(line.replace('\n', '').split(' '))
-        jn.append(["null_align"] + line.replace('\n', '').split(' '))
-    # for line in codecs.open('data/kyoto-train.cln.ja', encoding='utf-8'):
-    # #    j.append(line.replace('\n', ' ').split(' '))
-    #     # jws += line.replace('\n', '').split(' ')
-    #     j.append(line.replace('\n', '').split(' '))
-    #     jn.append(["null_align"] + line.replace('\n', '').split(' '))
-    #print(len(ews), len(jws))
-    # ej = zip(e, j)
-    ej = zip(en, j)
-    ej = list(ej)
-    # je = zip(j, e)
-    je = zip(jn, e)
-    je = list(je)
+    print('loading data', datetime.datetime.now())
 
-    #calculate initial translation probabilities
-    lj = len(set([w for js in j for w in js]))
-    f = lambda: 1. / lj
-    t_ej = defaultdict(f)
-    q_ej = defaultdict(random)
-    le = len(set([w for es in e for w in es]))
-    g = lambda: 1. / le
-    t_je = defaultdict(g)
-    q_je = defaultdict(random)
+    if language == 'japanese':
+        train_files = {'en':'data/kyoto-train.cln.en', 'f':'data/kyoto-train.cln.ja'}
+        dev_files = {'en':'data/english-dev.txt', 'f':'data/japanese-dev.txt'}
+        gold_file = 'data/align-dev.txt'
+        reverse_output = True
+        model_folder = 'models_jap'
+    elif language == 'french':
+        train_files = {'en':'fr_data/europarl-v6.fr-en.en', 'f':'fr_data/europarl-v6.fr-en.fr'}
+        dev_files = {'en':'fr_data/en-fr.en', 'f':'fr_data/en-fr.fr'}
+        gold_file = 'fr_data/en-fr.align'
+        reverse_output = False
+        model_folder = 'models_fr'
+    else:
+        assert False, 'language not found'
 
-    #set max number of iterations
-    m = 2
+    if load_model_from_file:
+        t_ef, q_ef = load_model(path.join(model_folder,'ef_model.pkl.ibm1'))
+        t_fe, q_fe = load_model(path.join(model_folder,'fe_model.pkl.ibm1'))
+    else:
 
-    #set precision
-    p = 0.1
+        #prepare train sentences
+        en_sent = load_sentences(train_files['en'], max_train)
+        f_sent = load_sentences(train_files['f'], max_train)
 
-    #train initial aligner with ibm1
+        print('training direction 1', datetime.datetime.now())
+        t_ef, q_ef = train_complete(en_sent, f_sent, path.join(model_folder,'ef_model.pkl'), ibm2=ibm2)
+        print('training direction 2', datetime.datetime.now())
+        t_fe, q_fe = train_complete(f_sent, en_sent, path.join(model_folder,'fe_model.pkl'), ibm2=ibm2)
 
-    '''
-    t_ej = train_ibm1(ej, t_ej, m, p)
-    print(datetime.datetime.now())
-
-    #continue training aligner with ibm2
-    t_ej, q_ej = train_ibm2(ej, t_ej, q_ej, m, p)
-    print(datetime.datetime.now())
-
-    # #continue training aligner with hmm
-    # t_ej, q_ej = train_hmm(ej, t_ej, q_ej, m, p)
-    # print(datetime.datetime.now())
-
-    #train initial aligner with ibm1
-    t_je = train_ibm1(je, t_je, m, p)
-    print(datetime.datetime.now())
-
-    #continue training aligner with ibm2
-    t_je, q_je = train_ibm2(je, t_je, q_je, m, p)
-    print(datetime.datetime.now())
-    '''
-
-    '''
-    file_pattern = 'pkl_ibm15ibm25/ibm15ibm25%s.pkl'
-    items = []
-    for item_name in ['t_ej','q_ej','t_je','q_je']:
-        with open(file_pattern%item_name,'rb') as f:
-            items.append(pickle.load(f))
-    t_ej, q_ej, t_je, q_je = items
-    '''
-
-    # #continue training aligner with hmm
-    # t_je, q_je = train_hmm(je, t_je, q_je, m, p)
-    # print(datetime.datetime.now())
-
-    #continue training aligner with hmm joint
-    # t_ej, q_ej, t_je, q_je = train_hmm_joint(ej, t_ej, q_ej, t_je, q_je, m, p, True)
-    # print(datetime.datetime.now())
-
-    # t_ej = dict(t_ej)
-    # q_ej = dict(q_ej)
-    #
-    # with open('pkl/ibm15hmm5t_ej.pkl', 'wb') as fp:
-    #     pickle.dump(t_ej, fp)
-    #
-    # with open('pkl/ibm15hmm5q_ej.pkl', 'wb') as fp:
-    #     pickle.dump(q_ej, fp)
-    #
-    # t_je = dict(t_je)
-    # q_je = dict(q_je)
-    #
-    # with open('pkl/ibm15hmm5t_je.pkl', 'wb') as fp:
-    #     pickle.dump(t_je, fp)
-    #
-    # with open('pkl/ibm15hmm5q_je.pkl', 'wb') as fp:
-    #     pickle.dump(q_je, fp)
-    #
-    t_ej = pickle.load(open('pkl/ibm15ibm25t_ej.pkl', 'rb'))
-    t_ej = defaultdict(f, t_ej)
-    print(datetime.datetime.now())
-    q_ej = pickle.load(open('pkl/ibm15ibm25q_ej.pkl', 'rb'))
-    q_ej = defaultdict(random, q_ej)
-    print(datetime.datetime.now())
-    t_je = pickle.load(open('pkl/ibm15ibm25t_je.pkl', 'rb'))
-    t_je = defaultdict(g, t_je)
-    print(datetime.datetime.now())
-    q_je = pickle.load(open('pkl/ibm15ibm25q_je.pkl', 'rb'))
-    q_je = defaultdict(random, q_je)
-    print(datetime.datetime.now())
 
     #prepare test sentences
-    e = []
-    en = []
-    j = []
-    jn = []
-    for line in codecs.open('data/english-dev.txt', encoding='utf-8'):
-        e.append(line.lower().replace('\n', '').split(' '))
-        en.append(["null_align"] + line.lower().replace('\n', '').split(' '))
-    for line in codecs.open('data/japanese-dev.txt', encoding='utf-8'):
-        j.append(line.replace('\n', '').split(' '))
-        jn.append(["null_align"] + line.replace('\n', '').split(' '))
+    en_sent = load_sentences(dev_files['en'])
+    f_sent = load_sentences(dev_files['f'])
 
+    dir1_alignments = []
+    dir2_alignments = []
+    intersection_alignments = []
+    union_alignments = []
+    num_intersection = 0
+    num_union = 0
+    for i in range(len(en_sent)):
+        # aligns each foreign word to the english one
+        align_ef = align_ibm(en_sent[i], f_sent[i], t_ef, q_ef)
+        align_ef = filter_null_alignments([(ei,fi) for fi,ei in enumerate(align_ef)])
+        # aligns each english word to a foreign one
+        align_fe = align_ibm(f_sent[i], en_sent[i], t_fe, q_fe)
+        align_fe = filter_null_alignments([(ei,fi) for ei,fi in enumerate(align_fe)])
+
+        dir1_alignments.append(align_ef)
+        dir2_alignments.append(align_fe)
+
+        intersection = combine_intersect(align_ef, align_fe)
+        union = combine_union(align_ef, align_fe)
+        num_intersection += len(intersection)
+        num_union += len(union)
+        intersection_alignments.append(intersection)
+        union_alignments.append(union)
+    print('intersection over union', num_intersection / num_union)
+
+    save_alignments(dir1_alignments, 'ibm-align-dir1.txt', reverse_output)
+    save_alignments(dir2_alignments, 'ibm-align-dir2.txt', reverse_output)
+    save_alignments(intersection_alignments, 'ibm-align-intersection.txt', reverse_output)
+    save_alignments(union_alignments, 'ibm-align-union.txt', reverse_output)
+    eval_alignments('ibm-align-dir1.txt', gold_file)
+    eval_alignments('ibm-align-dir2.txt', gold_file)
+    eval_alignments('ibm-align-intersection.txt', gold_file)
+
+    #align test sentences with dual decomp
+    alpha = 1
     mas = []
-    # num_intersection = 0
-    # num_union = 0
-    for i in range(len(e)):
-        align_eji = align(en[i], j[i], t_ej, q_ej)
-        align_jei = align(jn[i], e[i], t_je, q_je)
-        # align_eji = align(en[i], jn[i], t_ej, q_ej)
-        # align_jei = align(jn[i], en[i], t_je, q_je)
-        # intersection = combine_intersect(align_eji, align_jei)
-        # union = combine(align_eji, align_jei)
-        # num_intersection += len(intersection)
-        # num_union += len(union)
-        # print(len(intersection) / len(union))
-        # mas.append(union)
-        mas.append((align_eji, align_jei))
-    # print(num_intersection / num_union)
+    num_converged = 0
+    num_intersection = 0
+    num_union = 0
+    for i in range(len(en_sent)):
+        intersection, union, converged = align_dual(en_sent[i], f_sent[i], t_ef, t_fe, q_ef, q_fe, alpha)
+        intersection = filter_null_alignments(intersection)
+        union = filter_null_alignments(union)
 
-    #save alignments
-    output = open('data/align-dev_union_ibm12ibm22.txt', 'w')
-    # for ma in mas:
-    #     for ew, jw in ma:
-    #         if ew != 0 and jw != 0:
-    #             output.write(str(jw - 1) + '-' + str(ew - 1) + ' ')
-    #     output.write('\n')
-    # output.close()
+        num_intersection += len(intersection)
+        num_union += len(union)
+        mas.append(intersection)
+        if converged:
+            num_converged += 1
+    print(num_intersection / num_union)
+    print(float(num_converged) / len(en_sent))
 
+    save_alignments(mas, 'dual-decomp-intersection.txt', reverse_output)
+    eval_alignments('dual-decomp-intersection.txt', gold_file)
 
-    if False:
-        num_intersection = 0
-        num_union = 0
-        for align_eji, align_jei in mas:
-            intersection = 0
-            union = 0
-            list_union = []
-            for key, value in enumerate(align_eji):
-                if key != 0:
-                    union += 1
-                    num_union += 1
-                    list_union.append((value, key - 1))
-                    if (value + 1, key - 1) in enumerate(align_jei):
-                        intersection += 1
-                        num_intersection += 1
-                    output.write(str(value) + '-' + str(key - 1) + ' ')
-            for key, value in enumerate(align_jei):
-                if key != 0:
-                    if (key - 1, value) not in list_union:
-                        union += 1
-                        num_union += 1
-                    output.write(str(key - 1) + '-' + str(value) + ' ')
-            #print(intersection / union)
-            output.write('\n')
-        output.close()
-        print(num_intersection / num_union)
+    #print time at end
+    print('finished',datetime.datetime.now())
 
-    for alpha in [8, 16, 32, 64]:
-        print('alpha:', alpha)
-        #align test sentences
-        mas = []
-        num_converged = 0
-        num_intersection = 0
-        num_union = 0
-        for i in range(len(en)):
-            # alignment, converged = align_dual(en[i], jn[i], t_ej, t_je, q_ej, q_je)
-            intersection, union, converged = align_dual(en[i], jn[i], t_ej, t_je, q_ej, q_je, alpha)
-            intersection = [(ew, jw) for ew, jw in intersection if ew != 0 and jw != 0]
-            union = [(ew, jw) for ew, jw in union if ew != 0 and jw != 0]
-            #print(len(intersection) / len(union))
-            num_intersection += len(intersection)
-            num_union += len(union)
-            # mas.append(alignment)
-            mas.append(union)
-            if converged:
-                num_converged += 1
-        print(num_intersection / num_union)
-        print(float(num_converged) / len(en))
-
-        #save alignments
-        output = open('output-%s.txt'%alpha, 'w')
-        for ma in mas:
-            for ew, jw in ma:
-                if ew != 0 and jw != 0:
-                    output.write(str(jw - 1) + '-' + str(ew - 1) + ' ')
-            output.write('\n')
-        output.close()
-
-        #print time at end
-        print(datetime.datetime.now())
+if __name__ == '__main__':
+    main()
